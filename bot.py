@@ -1,7 +1,12 @@
 # bot.py
+# Telegram бот для планирования публикаций
+# Версия: 1.0.0
+# Автор: Lebouse
+
 import logging
 import datetime
 import re
+import asyncio
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ChatMember
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
@@ -9,11 +14,19 @@ from telegram.ext import (
 )
 from telegram.constants import ChatType, ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from pytz import utc
 
 from config import BOT_TOKEN, AUTHORIZED_USER_IDS, TIMEZONE
-from database import init_db, add_scheduled_message, get_all_active_messages, deactivate_message, add_trusted_chat, get_trusted_chats, archive_published_message
-from scheduler import start_scheduler
-from utils import parse_user_datetime, next_recurrence_time, escape_markdown_v2, detect_media_type
+from database import (
+    init_db, add_scheduled_message, get_all_active_messages,
+    deactivate_message, add_trusted_chat, get_trusted_chats,
+    archive_published_message, get_message_by_id, update_scheduled_message
+)
+from utils import (
+    parse_user_datetime, next_recurrence_time,
+    escape_markdown_v2, detect_media_type
+)
 
 # === Настройка логирования ===
 logging.basicConfig(
@@ -26,8 +39,10 @@ logger = logging.getLogger(__name__)
 # === Константы состояний для ConversationHandler ===
 (
     WAITING_CONTENT, SELECT_CHAT, INPUT_DATE, SELECT_RECURRENCE,
-    SELECT_PIN, SELECT_NOTIFY, SELECT_DELETE_DAYS
-) = range(7)
+    SELECT_PIN, SELECT_NOTIFY, SELECT_DELETE_DAYS, EDIT_MESSAGE_ID,
+    EDIT_CHAT, EDIT_CONTENT, EDIT_DATE, EDIT_RECURRENCE,
+    EDIT_PIN, EDIT_NOTIFY, EDIT_DELETE_DAYS
+) = range(16)
 
 user_sessions = {}
 
@@ -126,6 +141,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
             [InlineKeyboardButton("➕ Добавить", callback_data="add_publication")],
+            [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_publication")],
+            [InlineKeyboardButton("🗑️ Удалить", callback_data="delete_publication")],
             [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -200,6 +217,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 Главное меню\n\nВыберите действие:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return ConversationHandler.END
+    
+    elif query.data == "cancel":
+        user_sessions.pop(user_id, None)
+        await query.edit_message_text("❌ Операция отменена.")
         return ConversationHandler.END
     
     return ConversationHandler.END
@@ -311,7 +333,7 @@ async def input_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if utc_naive <= datetime.datetime.utcnow():
             await update.message.reply_text(
                 "❌ Дата должна быть в будущем!\n"
-                "Попробуйте снова:"
+                "Попробуйте снова (формат: ДД.ММ.ГГГГ ЧЧ:ММ):"
             )
             return INPUT_DATE
         
@@ -484,7 +506,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # === Публикация и перепланирование ===
-async def publish_and_reschedule(msg_id, context):
+async def publish_and_reschedule(msg_id, application):
     """Публикует сообщение и перепланирует следующую публикацию."""
     from database import get_db_connection
     
@@ -499,28 +521,28 @@ async def publish_and_reschedule(msg_id, context):
                 return
             
             # Публикуем сообщение
-            bot = context.bot
+            bot = application.bot
             content = task['message_text'] or task['caption'] or ""
-            media_id = task['photo_file_id'] or task['document_file_id']
+            photo_file_id = task['photo_file_id']
+            document_file_id = task['document_file_id']
             
             message = None
-            if media_id:
-                if task['photo_file_id']:
-                    message = await bot.send_photo(
-                        chat_id=task['chat_id'],
-                        photo=media_id,
-                        caption=escape_markdown_v2(content) if content else None,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_notification=not task['notify']
-                    )
-                elif task['document_file_id']:
-                    message = await bot.send_document(
-                        chat_id=task['chat_id'],
-                        document=media_id,
-                        caption=escape_markdown_v2(content) if content else None,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_notification=not task['notify']
-                    )
+            if photo_file_id:
+                message = await bot.send_photo(
+                    chat_id=task['chat_id'],
+                    photo=photo_file_id,
+                    caption=escape_markdown_v2(content) if content else None,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_notification=not task['notify']
+                )
+            elif document_file_id:
+                message = await bot.send_document(
+                    chat_id=task['chat_id'],
+                    document=document_file_id,
+                    caption=escape_markdown_v2(content) if content else None,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_notification=not task['notify']
+                )
             else:
                 message = await bot.send_message(
                     chat_id=task['chat_id'],
@@ -550,7 +572,8 @@ async def publish_and_reschedule(msg_id, context):
                 chat_id=task['chat_id'],
                 message_id=message.message_id,
                 content=content,
-                photo_file_id=media_id
+                photo_file_id=photo_file_id,
+                document_file_id=document_file_id
             )
             
             logger.info(f"✅ Опубликовано сообщение ID={message.message_id} для задачи {msg_id}")
@@ -558,20 +581,13 @@ async def publish_and_reschedule(msg_id, context):
             # Планируем удаление если нужно
             if task['delete_after_days']:
                 deletion_time = datetime.datetime.utcnow() + datetime.timedelta(days=task['delete_after_days'])
-                scheduler = AsyncIOScheduler()
-                scheduler.add_job(
-                    delete_message,
-                    'date',
-                    run_date=deletion_time,
-                    args=[context, task['chat_id'], message.message_id],
-                    id=f"delete_{message.message_id}"
-                )
+                schedule_message_deletion(application, task['chat_id'], message.message_id, deletion_time)
                 logger.info(f"⏰ Запланировано удаление сообщения {message.message_id} через {task['delete_after_days']} дней")
             
             # Перепланируем следующую публикацию для повторяющихся задач
             if task['recurrence'] != 'once':
                 next_time = next_recurrence_time(
-                    original=datetime.datetime.fromisoformat(task['publish_at']),
+                    original=datetime.datetime.fromisoformat(task['original_publish_at']),
                     recurrence=task['recurrence'],
                     last=datetime.datetime.fromisoformat(task['publish_at'])
                 )
@@ -597,14 +613,29 @@ async def publish_and_reschedule(msg_id, context):
     except Exception as e:
         logger.error(f"Ошибка при публикации задачи {msg_id}: {e}", exc_info=True)
 
-async def delete_message(context, chat_id, message_id):
+async def delete_message(application, chat_id, message_id):
     """Удаляет сообщение из чата."""
     try:
-        bot = context.bot
+        bot = application.bot
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         logger.info(f"🗑️ Сообщение {message_id} удалено из чата {chat_id}")
     except Exception as e:
         logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
+
+def schedule_message_deletion(application, chat_id, message_id, deletion_time):
+    """Запланировать удаление сообщения."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        delete_message,
+        'date',
+        run_date=deletion_time,
+        args=[application, chat_id, message_id],
+        id=f"delete_{message_id}",
+        misfire_grace_time=3600
+    )
+    scheduler.start()
 
 # === Основная функция ===
 async def main():
@@ -635,6 +666,8 @@ async def main():
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("cancel", cancel))
     
+    # ИМПОРТИРУЕМ start_scheduler только внутри функции, где он нужен
+    from scheduler import start_scheduler
     # Запускаем планировщик
     await start_scheduler(application)
     
