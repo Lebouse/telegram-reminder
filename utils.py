@@ -48,8 +48,6 @@ def next_recurrence_time(original: datetime.datetime, recurrence: str, last: dat
     if recurrence == 'once':
         return None
     
-    now = datetime.datetime.utcnow()
-    
     try:
         if recurrence == 'daily':
             return last + datetime.timedelta(days=1)
@@ -61,8 +59,17 @@ def next_recurrence_time(original: datetime.datetime, recurrence: str, last: dat
             # Прибавляем один месяц
             month = last.month % 12 + 1
             year = last.year + (1 if last.month == 12 else 0)
+            # Сохраняем тот же день месяца, если возможно
             day = min(last.day, 28)  # Максимум 28 дней для февраля
-            return datetime.datetime(year, month, day, last.hour, last.minute, tzinfo=utc)
+            try:
+                next_date = datetime.datetime(year, month, day, last.hour, last.minute, tzinfo=utc)
+                return next_date
+            except ValueError:
+                # Если день не существует (например, 31 февраля), используем последний день месяца
+                import calendar
+                last_day = calendar.monthrange(year, month)[1]
+                next_date = datetime.datetime(year, month, last_day, last.hour, last.minute, tzinfo=utc)
+                return next_date
     
     except Exception as e:
         logger.warning(f"Ошибка расчёта следующего времени: {e}")
@@ -89,9 +96,9 @@ def detect_media_type(file_id: str) -> Optional[str]:
         return None
     
     # В реальной реализации нужно получать информацию о файле через API
-    if file_id.startswith('AgAC') or file_id.startswith('AAMC'):
+    if file_id.startswith(('AgAC', 'AAMC', 'AgAD', 'AAMD')):
         return 'photo'
-    elif file_id.startswith('BQAC') or file_id.startswith('BAMC'):
+    elif file_id.startswith(('BQAC', 'BAMC', 'BQAD', 'BAMD')):
         return 'document'
     
     return None
