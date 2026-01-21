@@ -7,13 +7,15 @@ from pytz import utc
 
 from config import TIMEZONE
 from database import get_all_active_messages
-from bot import publish_and_reschedule
+# УДАЛЯЕМ: from bot import publish_and_reschedule
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 def schedule_all_jobs(application):
     """Планирует все активные задачи при запуске."""
+    from bot import publish_and_reschedule  # ИМПОРТИРУЕМ ТОЛЬКО ВНУТРИ ФУНКЦИИ
+    
     messages = get_all_active_messages()
     for msg in messages:
         if not msg['active']:
